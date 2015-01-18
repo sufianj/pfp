@@ -1,5 +1,10 @@
-package test;
+package rs1;
 
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -17,6 +22,15 @@ import org.apache.mahout.common.RandomUtils;
 import org.apache.mahout.common.RandomWrapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.IntWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 
 /** Minimalistic implementation of Parallel SGD factorizer based on
  * <a href="http://www.sze.hu/~gtakacs/download/jmlr_2009.pdf">
@@ -54,9 +68,6 @@ public class MySGDFactorizer extends AbstractFactorizer {
   protected volatile double[][] userVectors;
   /** item features */
   protected volatile double[][] itemVectors;
-  
-  private static long[] cachedUserIDs;
-  private static long[] cachedItemIDs;
 
   private final PreferenceShuffler shuffler;
 
@@ -70,6 +81,11 @@ public class MySGDFactorizer extends AbstractFactorizer {
   private static final double NOISE = 1;//the original one was set to 0.02
 
   private static final Logger logger = LoggerFactory.getLogger(MySGDFactorizer.class);
+  
+  
+  private static long UserIndex[];
+  private static long ItemIndex[];
+
 
   protected static class PreferenceShuffler {
 
@@ -81,6 +97,7 @@ public class MySGDFactorizer extends AbstractFactorizer {
     public PreferenceShuffler(DataModel dataModel) throws TasteException {
       cachePreferences(dataModel);
       shuffle();
+      stage();
     }
 
     private int countPreferences(DataModel dataModel) throws TasteException {
@@ -93,7 +110,7 @@ public class MySGDFactorizer extends AbstractFactorizer {
       return numPreferences;
     }
 /*-------To change--------------------------------------------begign----------------------*/
-    /*private void cachePreferences(DataModel dataModel) throws TasteException {
+    private void cachePreferences(DataModel dataModel) throws TasteException {
       int numPreferences = countPreferences(dataModel);
       preferences = new Preference[numPreferences];
 
@@ -106,47 +123,28 @@ public class MySGDFactorizer extends AbstractFactorizer {
           preferences[index++] = preference;
         }
       }
-    }*/
-    
-    private void cachePreferences(DataModel dataModel) throws TasteException {
-        int numPreferences = countPreferences(dataModel);
-        cachedUserIDs = new long[numPreferences];
-        cachedItemIDs = new long[numPreferences];
-
-        LongPrimitiveIterator userIDs = dataModel.getUserIDs();
-        int index = 0;
-        while (userIDs.hasNext()) {
-          long userID = userIDs.nextLong();
-          PreferenceArray preferencesFromUser = dataModel.getPreferencesFromUser(userID);
-          for (Preference preference : preferencesFromUser) {
-            cachedUserIDs[index] = userID;
-            cachedItemIDs[index] = preference.getItemID();
-            index++;
-          }
-        }
-      }
+    }
 
     public void shuffle() {
-    	RandomWrapper random = RandomUtils.getRandom();
+      unstagedPreferences = preferences.clone();
       /* Durstenfeld shuffle */
-      for (int currentPos = cachedUserIDs.length - 1; currentPos > 0; currentPos--) {
-          int swapPos = random.nextInt(currentPos + 1);
-          swapCachedPreferences(currentPos, swapPos);
+      for (int i = unstagedPreferences.length - 1; i > 0; i--) {
+        int rand = random.nextInt(i + 1);
+        swapCachedPreferences(i, rand);
       }
     }
 
     //merge this part into shuffle() will make compiler-optimizer do some real absurd stuff, test on OpenJDK7
-    private void swapCachedPreferences(int posA, int posB) {
-    	long tmpUserIndex = cachedUserIDs[posA];
-        long tmpItemIndex = cachedItemIDs[posA];
+    private void swapCachedPreferences(int x, int y) {
+      Preference p = unstagedPreferences[x];
 
-        cachedUserIDs[posA] = cachedUserIDs[posB];
-        cachedItemIDs[posA] = cachedItemIDs[posB];
-
-        cachedUserIDs[posB] = tmpUserIndex;
-        cachedItemIDs[posB] = tmpItemIndex;
+      unstagedPreferences[x] = unstagedPreferences[y];
+      unstagedPreferences[y] = p;
     }
 
+    public void stage() {
+      preferences = unstagedPreferences;
+    }
 
 /*-------To change--------------------------------------------end----------------------*/
 
@@ -242,49 +240,73 @@ public class MySGDFactorizer extends AbstractFactorizer {
   public Factorization factorize() throws TasteException {
     initialize();
 
+    int numStrata = 3;
+	int size = 3;
+	double[][] test1;
+
+    
     if (logger.isInfoEnabled()) {
       logger.info("starting to compute the factorization...");
     }
 
     for (epoch = 1; epoch <= numEpochs; epoch++) {
+      shuffler.stage();
 
       final double mu = getMu(epoch);
       int subSize = shuffler.size() / numThreads + 1;
 
-      /*---To change--How to make a mapper here------------begin--------*/
+/*---To change--How to make a mapper here------------begin--------*/
       ExecutorService executor=Executors.newFixedThreadPool(numThreads);
 
-      try {
-        for (int t = 0; t < numThreads; t++) {
-          final int iStart = t * subSize;
-          final int iEnd = Math.min((t + 1) * subSize, shuffler.size());
+ //to do :read the UserIndex[i],ItemIndex[j]
+      
+    	  float [][][][] ratinglist = new float[3][3][3][3];
+    	  double [][][][] UVectors = new double [3][3][3][3+FEATURE_OFFSET];
+    	  double [][][][] IVectors = new double [3][3][3][3+FEATURE_OFFSET];
+        	for(int bi=0; bi != numStrata; bi++){
+ 			   for(int bj=0; bj != numStrata; bj++){
+ 				   int indexStratum = (bi + bj) % numStrata;
+ 				   int indexBlock = bj;
+ 				   //int indexRating = 0;
+ 				   for(int i=bi*size; i!=(bi+1)*size; i++){
+ 					   UVectors[indexStratum][indexBlock][i-bi*size] = userVectors[i];
+ 					   for(int j=bj*size; j!=(bj+1)*size; j++){ 
+ 						  Float rating= dataModel.getPreferenceValue(UserIndex[i],ItemIndex[j]);
+ 						   if (rating != null)
+ 						   {	
+ 							  ratinglist[indexStratum][indexBlock][i-bi*size][j-bj*size] = rating;
+ 							  
+ 							//System.out.print(String.format("%d,%d,%d\n", UserIndex[i], ItemIndex[j],rating.intValue()));
+ 								//test1[][]
+ 						   }//end if
+ 						   
+ 					   }//end for 4-j
+ 					   
+ 				   }//end for 3-i
+ 				  for(int j=bj*size; j!=(bj+1)*size; j++){ 
+ 					  IVectors[indexStratum][indexBlock][j-bj*size] = itemVectors[j];
+ 				  }//end for 3-j
+ 			   }//end for 2 -bj
+ 		}//end for 1 -bi
+        	
+        	
+        /*  final int iStart = t * subSize;
+          final int iEnd = Math.min((t + 1) * subSize, shuffler.size());*/
 
           executor.execute(new Runnable() {
             @Override
             public void run() {
-            /*------------job for each node: for the preferences in the block ---------begin----------*/
-              for (int i = iStart; i < iEnd; i++) {  
+            /*--------------------job for each node: for the preferences in the block ------------begin-------------*/
+              /*for (int i = iStart; i < iEnd; i++) {  
                 update(shuffler.get(i), mu);
-              }
-              /*----------job for each node: for the preferences in the block ---------end------------*/
+              }*/
+            	
+              /*--------------------job for each node: for the preferences in the block -----------end------------*/
             }
           });
-        }
-      } finally {
-        executor.shutdown();
-        shuffler.shuffle();
-
-        try {
-          boolean terminated = executor.awaitTermination(numEpochs * shuffler.size(), TimeUnit.MICROSECONDS);
-          if (!terminated) {
-            logger.error("subtasks takes forever, return anyway");
-          }
-        } catch (InterruptedException e) {
-          throw new TasteException("waiting fof termination interrupted", e);
-        }
       }
 
-    }
+    
 
     return createFactorization(userVectors, itemVectors);
   }
@@ -316,6 +338,7 @@ public class MySGDFactorizer extends AbstractFactorizer {
    *            so it's impact on accuracy may still be unknown.
    * BAD SIDE3: don't know how to make it work for L1-regularization or
    *            "pseudorank?" (sum of singular values)-regularization */
+  
   protected void update(Preference preference, double mu) {
     int userIndex = userIndex(preference.getUserID());
     int itemIndex = itemIndex(preference.getItemID());
